@@ -1,0 +1,40 @@
+app = "lumina-gateway"
+primary_region = "bom"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  GATEWAY_PORT = "8787"
+  NODE_ENV = "production"
+  LOG_LEVEL = "info"
+
+[[services]]
+  internal_port = 8787
+  protocol = "tcp"
+
+  [[services.ports]]
+    handlers = ["http"]
+    port = 80
+
+  [[services.ports]]
+    handlers = ["tls", "http"]
+    port = 443
+
+  # SSE needs longer timeout
+  [[services.http_checks]]
+    grace_period = "10s"
+    interval = "15s"
+    method = "GET"
+    path = "/health"
+    timeout = "5s"
+
+[checks]
+  [checks.health]
+    grace_period = "10s"
+    interval = "15s"
+    method = "GET"
+    path = "/health"
+    port = 8787
+    timeout = "5s"
+    type = "http"

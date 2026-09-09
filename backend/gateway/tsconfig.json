@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "paths": {
+      "@lumina/contract": [
+        "../../packages/contract/src/index.ts"
+      ]
+    }
+  },
+  "include": ["src/**/*"]
+}

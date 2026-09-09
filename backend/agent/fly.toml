@@ -1,0 +1,34 @@
+app = "lumina-agent"
+primary_region = "bom"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  AGENT_PORT = "8000"
+  NODE_ENV = "production"
+  VECTOR_BACKEND = "mongo-cosine-scan"
+  SEARCH_PROVIDER = "tavily"
+  LLM_MODEL = "openai/gpt-4o-mini"
+  EMBEDDING_MODEL = "baai/bge-m3"
+  IMAGE_DAILY_CAP = "10"
+  DRY_RUN = "false"
+  LOG_LEVEL = "info"
+
+[[services]]
+  internal_port = 8000
+  protocol = "tcp"
+
+  # IMPORTANT: internal only — not exposed to internet
+  [[services.ports]]
+    port = 8000
+
+[checks]
+  [checks.health]
+    grace_period = "10s"
+    interval = "15s"
+    method = "GET"
+    path = "/health"
+    port = 8000
+    timeout = "5s"
+    type = "http"

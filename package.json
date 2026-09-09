@@ -1,0 +1,23 @@
+{
+  "name": "lumina",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "backend/*",
+    "web"
+  ],
+  "scripts": {
+    "dev:agent": "npm run dev --workspace=backend/agent",
+    "dev:gateway": "npm run dev --workspace=backend/gateway",
+    "dev": "concurrently \"npm run dev:agent\" \"npm run dev:gateway\"",
+    "create:indexes": "node scripts/create-indexes.mjs",
+    "bench": "node benchmark/bench.mjs",
+    "bench:smoke": "node benchmark/bench.mjs --smoke",
+    "quality": "node quality/check.mjs ."
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2",
+    "typescript": "^5.4.0"
+  }
+}
