@@ -121,7 +121,9 @@ app.use(
 );
 
 // ── Start ─────────────────────────────────────────────────────
-const PORT = parseInt(process.env.GATEWAY_PORT ?? "8787");
+// Render (and most PaaS hosts) assign the public port via $PORT — that takes priority
+// over GATEWAY_PORT, which stays the local-dev default.
+const PORT = parseInt(process.env.PORT ?? process.env.GATEWAY_PORT ?? "8787");
 app.listen(PORT, () => {
   console.log(`[gateway] listening on :${PORT}`);
 });

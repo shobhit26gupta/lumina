@@ -12,6 +12,7 @@ primary_region = "bom"
   LLM_MODEL = "openai/gpt-4o-mini"
   EMBEDDING_MODEL = "baai/bge-m3"
   IMAGE_DAILY_CAP = "10"
+  DEEP_DAILY_CAP = "5"
   DRY_RUN = "false"
   LOG_LEVEL = "info"
 

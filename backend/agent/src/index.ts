@@ -41,17 +41,19 @@ app.get("/health", async (req, res) => {
 
 // ── Stats ────────────────────────────────────────────────────
 app.get("/stats", async (req, res) => {
+  const userId = req.headers["x-user-id"] as string;
   const today = new Date();
   today.setHours(0, 0, 0, 0);
 
-  const [requests, answers, todayRequests, images] = await Promise.all([
+  const [requests, answers, todayRequests, images, deepToday] = await Promise.all([
     col.requests().countDocuments({}),
     col.messages().countDocuments({ role: "assistant" }),
     col.requests().find({ createdAt: { $gte: today } }).toArray(),
-    col.artifacts().countDocuments({ 
-      kind: "image", 
-      createdAt: { $gte: today } 
+    col.artifacts().countDocuments({
+      kind: "image",
+      createdAt: { $gte: today }
     }),
+    col.runs().countDocuments({ userId, depth: "deep", createdAt: { $gte: today } }),
   ]);
 
   const costToday = todayRequests.reduce(
@@ -71,6 +73,8 @@ app.get("/stats", async (req, res) => {
     costUsdToday: Math.round(costToday * 10000) / 10000,
     imagesToday:  images,
     imageDailyCap: parseInt(process.env.IMAGE_DAILY_CAP ?? "10"),
+    deepToday,
+    deepDailyCap: parseInt(process.env.DEEP_DAILY_CAP ?? "5"),
   });
 });
 
@@ -135,13 +139,26 @@ app.post("/threads/:id/ask", async (req, res) => {
   const { query, mode = "auto", depth = "quick", spaceId } = req.body;
   if (!query) return res.status(400).json({ error: "query required" });
 
-  // Deep search (plan_research + sub-question decomposition) isn't implemented yet —
-  // reject honestly rather than silently running a quick search under a deep label.
+  // Deep search costs several times a quick search — a per-user daily cap, same shape as
+  // the image daily cap, so a runaway deep habit can't run away with the budget.
   if (depth === "deep") {
-    return res.status(501).json({ error: "deep search is not implemented" });
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const cap   = parseInt(process.env.DEEP_DAILY_CAP ?? "5");
+    const count = await col.runs().countDocuments({
+      userId, depth: "deep", createdAt: { $gte: today },
+    });
+    if (count >= cap) {
+      const tomorrow = new Date(today);
+      tomorrow.setDate(tomorrow.getDate() + 1);
+      return res.status(429).json({
+        error:    "Daily deep search cap reached",
+        resetsAt: tomorrow.toISOString(),
+      });
+    }
   }
 
-  const requestId = (req.headers["x-request-id"] as string) 
+  const requestId = (req.headers["x-request-id"] as string)
                     ?? genId("req");
 
   await col.messages().insertOne({
@@ -165,6 +182,7 @@ app.post("/threads/:id/ask", async (req, res) => {
       userId,
       query,
       mode,
+      depth,
       spaceId,
       res,
     });
@@ -425,9 +443,15 @@ app.get("/evals/report.json", async (req, res) => {
 });
 
 // ── Boot ─────────────────────────────────────────────────────
+// Fly.io keeps the agent unreachable via private networking (no public port in fly.toml),
+// so it binds every interface there. A combined single-container deploy (e.g. Render's
+// free tier, which has no private-service option) has no such network-level isolation —
+// AGENT_BIND_HOST=127.0.0.1 makes the agent unreachable from outside that container by
+// simply never listening on a public interface at all.
+const HOST = process.env.AGENT_BIND_HOST ?? "0.0.0.0";
 connectDB().then(() => {
-  app.listen(PORT, () => {
-    console.log(`[agent] listening on :${PORT}`);
+  app.listen(PORT, HOST, () => {
+    console.log(`[agent] listening on ${HOST}:${PORT}`);
   });
   startWorker(); // start background jobs worker
 }).catch((e) => {

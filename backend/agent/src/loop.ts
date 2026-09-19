@@ -1,7 +1,7 @@
 import OpenAI from "openai";
 import { Response } from "express";
 import { col } from "./db.js";
-import { genId, calcCost, nowIso } from "./utils.js";
+import { genId, calcCost } from "./utils.js";
 import {
   webSearch,
   fetchPage,
@@ -9,11 +9,7 @@ import {
   saveMemory,
   searchDocuments,
 } from "./tools/index.js";
-import { RunLog, Source } from "@lumina/contract";
-
-// The 5 tools this loop actually calls. `plan_research` (deep search) exists in the
-// contract's ToolName but isn't implemented here — deep requests are rejected upstream.
-type OurTool = "web_search" | "fetch_page" | "search_documents" | "recall_memory" | "save_memory";
+import { RunLog, Source, SubQuestion, ToolName } from "@lumina/contract";
 import { writeFile, mkdir } from "fs/promises";
 import { join } from "path";
 
@@ -24,8 +20,15 @@ const openai = new OpenAI({
 });
 
 const MODEL         = process.env.LLM_MODEL ?? "openai/gpt-4o-mini";
-const MAX_TOOL_CALLS = 8;   // hard cap per PRD
-const MAX_MS        = 90_000; // 90 second wall clock limit
+
+// Quick: cheap and fast by default (PRD budget). Deep: several times the envelope, capped
+// well inside expectations.json's wide budget (maxToolCalls 24, maxWallClockSec 240).
+const MAX_TOOL_CALLS_QUICK = 8;
+const MAX_MS_QUICK         = 90_000;
+const MAX_TOOL_CALLS_DEEP  = 20;
+const MAX_MS_DEEP          = 200_000;
+const MIN_SUB_QUESTIONS    = 3;
+const MAX_SUB_QUESTIONS    = 6;
 
 // ── SSE helper ───────────────────────────────────────────────
 // Writes one SSE event to the browser
@@ -35,15 +38,33 @@ function sse(res: Response, event: string, data: unknown) {
 }
 
 // ── System prompt ────────────────────────────────────────────
-function buildSystemPrompt(memorySummary: string): string {
-  return `You are LUMINA, a research assistant that gives grounded, 
+function buildSystemPrompt(memorySummary: string, depth: "quick" | "deep", useDocs: boolean): string {
+  const routingRule = useDocs
+    ? `- The user has a Space with uploaded documents available (search_documents). Try
+  search_documents FIRST for this question. Only use web_search if the documents come back
+  empty or clearly don't cover what's being asked — don't default to the web just because
+  it's the more familiar tool.`
+    : `- Use web_search then fetch_page to get full content`;
+
+  const deepRules = `
+- This is a DEEP search. Call plan_research FIRST, before any other tool — decompose the
+  question into ${MIN_SUB_QUESTIONS}-${MAX_SUB_QUESTIONS} focused sub-questions that together cover it. No search
+  tool will run until you do.
+- After planning, tag every web_search / fetch_page / search_documents call with the
+  "subQuestion" number (1-based, from your plan) it serves.
+- Your final answer must address every sub-question and cite sources across all of them —
+  citation numbers are one continuous list for the whole answer, not per sub-question.
+- Deep search costs several times a quick search. Make the sub-questions earn that: each
+  one should surface something a single quick search would have missed.`;
+
+  return `You are LUMINA, a research assistant that gives grounded,
 cited answers from sources you actually retrieved.
 
 ${memorySummary ? `User preferences:\n${memorySummary}\n` : ""}
 
 RULES:
 - Always call recall_memory first to personalize your answer
-- Use web_search then fetch_page to get full content
+${routingRule}
 - Every claim MUST have an inline citation like [1], [2]
 - Citation numbers restart at [1] every turn and refer ONLY to the sources retrieved THIS
   turn. Earlier turns in this conversation used their own [1], [2]... — those numbers are
@@ -51,7 +72,8 @@ RULES:
   from an earlier answer.
 - Never fabricate sources or cite URLs you didn't fetch
 - If you find nothing, say so honestly
-- Maximum ${MAX_TOOL_CALLS} tool calls total
+- Maximum ${depth === "deep" ? MAX_TOOL_CALLS_DEEP : MAX_TOOL_CALLS_QUICK} tool calls total
+${depth === "deep" ? deepRules : ""}
 
 ANSWER FORMAT:
 - Be concise and factual
@@ -60,8 +82,9 @@ ANSWER FORMAT:
 }
 
 // ── Tool definitions (what the LLM can call) ─────────────────
-function buildTools(useWeb: boolean, useDocs: boolean) {
+function buildTools(useWeb: boolean, useDocs: boolean, depth: "quick" | "deep") {
   const tools: OpenAI.Chat.ChatCompletionTool[] = [];
+  const deep = depth === "deep";
 
   tools.push({
     type: "function",
@@ -70,13 +93,45 @@ function buildTools(useWeb: boolean, useDocs: boolean) {
       description: "Get the user's saved preferences. Always call this first.",
       parameters: {
         type: "object",
-        properties: { 
-          query: { type: "string" } 
+        properties: {
+          query: { type: "string" }
         },
         required: ["query"],
       },
     },
   });
+
+  // DEEP SEARCH ONLY — never offered to a quick search, so a quick run can never call it
+  // (rule R2: depth is opted into, never drifted into).
+  if (deep) {
+    tools.push({
+      type: "function",
+      function: {
+        name: "plan_research",
+        description:
+          `Decompose the question into ${MIN_SUB_QUESTIONS}-${MAX_SUB_QUESTIONS} sub-questions. ` +
+          "Call this FIRST, before any search — no other tool runs until you do.",
+        parameters: {
+          type: "object",
+          properties: {
+            subQuestions: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  question: { type: "string" },
+                  reason:   { type: "string", description: "why this sub-question matters" },
+                },
+                required: ["question"],
+              },
+            },
+            reason: { type: "string", description: "the plan overall, in one line" },
+          },
+          required: ["subQuestions"],
+        },
+      },
+    });
+  }
 
   if (useWeb) {
     tools.push({
@@ -86,8 +141,9 @@ function buildTools(useWeb: boolean, useDocs: boolean) {
         description: "Search the internet for current information.",
         parameters: {
           type: "object",
-          properties: { 
-            query: { type: "string" } 
+          properties: {
+            query: { type: "string" },
+            ...(deep ? { subQuestion: { type: "number", description: "which sub-question (1-based) this serves" } } : {}),
           },
           required: ["query"],
         },
@@ -101,8 +157,9 @@ function buildTools(useWeb: boolean, useDocs: boolean) {
         description: "Read the full text of a webpage. Use after web_search.",
         parameters: {
           type: "object",
-          properties: { 
-            url: { type: "string" } 
+          properties: {
+            url: { type: "string" },
+            ...(deep ? { subQuestion: { type: "number", description: "which sub-question (1-based) this serves" } } : {}),
           },
           required: ["url"],
         },
@@ -115,12 +172,14 @@ function buildTools(useWeb: boolean, useDocs: boolean) {
       type: "function",
       function: {
         name: "search_documents",
-        description: "Search the user's uploaded documents.",
+        description: "Search the user's uploaded documents in the current Space.",
         parameters: {
           type: "object",
           properties: {
-            query:   { type: "string" },
-            spaceId: { type: "string" },
+            query: { type: "string" },
+            // No spaceId param — the model doesn't know it and shouldn't guess; the
+            // dispatcher always scopes this to the Space the request actually selected.
+            ...(deep ? { subQuestion: { type: "number", description: "which sub-question (1-based) this serves" } } : {}),
           },
           required: ["query"],
         },
@@ -135,8 +194,8 @@ function buildTools(useWeb: boolean, useDocs: boolean) {
       description: "Save a stable user preference for future sessions.",
       parameters: {
         type: "object",
-        properties: { 
-          text: { type: "string" } 
+        properties: {
+          text: { type: "string" }
         },
         required: ["text"],
       },
@@ -153,15 +212,18 @@ export async function runAgentLoop(opts: {
   userId:    string;
   query:     string;
   mode:      "auto" | "web" | "docs";
+  depth:     "quick" | "deep";
   spaceId?:  string;
   res:       Response;
 }): Promise<void> {
-  const { requestId, threadId, userId, query, mode, spaceId, res } = opts;
+  const { requestId, threadId, userId, query, mode, depth, spaceId, res } = opts;
   const startMs = Date.now();
 
   // Decide which tools to offer
   const useWeb  = mode !== "docs";
   const useDocs = mode !== "web" && !!spaceId;
+  const maxToolCalls = depth === "deep" ? MAX_TOOL_CALLS_DEEP : MAX_TOOL_CALLS_QUICK;
+  const maxMs        = depth === "deep" ? MAX_MS_DEEP        : MAX_MS_QUICK;
 
   // Tracking state
   const sources: Source[] = [];
@@ -172,6 +234,7 @@ export async function runAgentLoop(opts: {
   let ttftMs       = 0;
   let step         = 0;
   let terminated: "done" | "cap" | "error" = "done";
+  let planSubQuestions: SubQuestion[] | undefined; // set once plan_research runs (deep only)
 
   // Load thread history
   const history = await col.messages()
@@ -190,7 +253,7 @@ export async function runAgentLoop(opts: {
   // old turn's [3] left in the raw history text is not a valid reference in this turn and
   // only invites the model to cite a number that doesn't exist in this turn's sources.
   const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
-    { role: "system", content: buildSystemPrompt(memorySummary) },
+    { role: "system", content: buildSystemPrompt(memorySummary, depth, useDocs) },
     ...history.map((m: any) => ({
       role:    m.role as "user" | "assistant",
       content: m.role === "assistant"
@@ -200,43 +263,77 @@ export async function runAgentLoop(opts: {
     { role: "user", content: query },
   ];
 
-  const tools = buildTools(useWeb, useDocs);
+  const tools = buildTools(useWeb, useDocs, depth);
   let loopCount = 0;
 
   // ── ReAct loop ─────────────────────────────────────────────
   while (true) {
     // Check caps
-    if (loopCount >= MAX_TOOL_CALLS || Date.now() - startMs > MAX_MS) {
+    if (loopCount >= maxToolCalls || Date.now() - startMs > maxMs) {
       terminated = "cap";
       break;
     }
 
-    // Call the LLM
-    const completion = await openai.chat.completions.create({
+    // Call the LLM — streamed, so the answer's actual tokens reach the browser as the
+    // model generates them instead of appearing all at once after a silent wait.
+    const stream = await openai.chat.completions.create({
       model: MODEL,
       messages,
       tools,
       tool_choice: "auto",
+      stream: true,
+      stream_options: { include_usage: true },
     });
 
-    const choice = completion.choices[0];
-    totalIn  += completion.usage?.prompt_tokens     ?? 0;
-    totalOut += completion.usage?.completion_tokens ?? 0;
+    let content = "";
+    let sourcesSent = false;
+    let finishReason: string | null = null;
+    const toolCallAcc: Record<number, { id: string; name: string; args: string }> = {};
+
+    for await (const chunk of stream) {
+      const delta = chunk.choices?.[0]?.delta;
+
+      if (delta?.content) {
+        // Sources must arrive before the first token (contract requirement) — the first
+        // content delta IS the first token, so this is the last possible moment.
+        if (!sourcesSent) {
+          sse(res, "sources", sources);
+          sourcesSent = true;
+        }
+        if (!ttftMs) ttftMs = Date.now() - startMs;
+        content += delta.content;
+        sse(res, "token", { text: delta.content });
+      }
+
+      if (delta?.tool_calls) {
+        if (!ttftMs) ttftMs = Date.now() - startMs;
+        for (const tc of delta.tool_calls) {
+          const acc = (toolCallAcc[tc.index] ??= { id: "", name: "", args: "" });
+          if (tc.id)              acc.id   = tc.id;
+          if (tc.function?.name)  acc.name += tc.function.name;
+          if (tc.function?.arguments) acc.args += tc.function.arguments;
+        }
+      }
+
+      if (chunk.choices?.[0]?.finish_reason) finishReason = chunk.choices[0].finish_reason;
+      if (chunk.usage) {
+        totalIn  += chunk.usage.prompt_tokens     ?? 0;
+        totalOut += chunk.usage.completion_tokens ?? 0;
+      }
+    }
+
+    const toolCalls = Object.values(toolCallAcc).map((t) => ({
+      id: t.id,
+      type: "function" as const,
+      function: { name: t.name, arguments: t.args },
+    }));
 
     // ── LLM decided to answer (no more tool calls) ──────────
-    if (choice.finish_reason === "stop") {
-      const content = choice.message.content ?? "";
-
-      // Record TTFT
+    if (finishReason === "stop") {
+      // An empty answer never triggered a content delta above — sources still have to
+      // arrive before `done` even when there's nothing to cite them in.
+      if (!sourcesSent) sse(res, "sources", sources);
       if (!ttftMs) ttftMs = Date.now() - startMs;
-
-      // Send sources BEFORE first token (contract requirement!)
-      sse(res, "sources", sources);
-
-      // Stream answer word by word
-      for (const word of content.split(/(\s+)/)) {
-        sse(res, "token", { text: word });
-      }
 
       // Save assistant message to DB
       const answerId = genId("ans");
@@ -263,29 +360,33 @@ export async function runAgentLoop(opts: {
         costUsd,
         searchCached,
         terminated,
-        depth: "quick",
+        depth,
+        ...(planSubQuestions ? { subQuestions: planSubQuestions.length } : {}),
       });
 
       // Save run log
       await saveRunLog(requestId, {
         requestId,
+        userId,
+        threadId,
+        query,
         tokens:       totalIn + totalOut,
         wallClockSec: latencyMs / 1000,
         costUsd,
         terminated,
-        depth:        "quick",
+        depth,
         toolCalls:    toolCallLog,
-        createdAt:    nowIso(),
+        createdAt:    new Date(),
       });
 
       break;
     }
 
     // ── LLM wants to call tools ──────────────────────────────
-    if (choice.finish_reason === "tool_calls" && choice.message.tool_calls) {
-      messages.push(choice.message);
+    if (finishReason === "tool_calls" && toolCalls.length) {
+      messages.push({ role: "assistant", content: content || null, tool_calls: toolCalls });
 
-      for (const tc of choice.message.tool_calls) {
+      for (const tc of toolCalls) {
         loopCount++;
         const name    = tc.function.name;
         const args    = JSON.parse(tc.function.arguments);
@@ -298,6 +399,45 @@ export async function runAgentLoop(opts: {
         let ok = true;
         let errStr: string | undefined;
 
+        // Deep search must plan before it retrieves anything (PlanEvent's whole point).
+        // A search tool called before plan_research gets refused, not silently allowed.
+        if (depth === "deep" && name !== "plan_research" && name !== "recall_memory" && !planSubQuestions) {
+          const ms = Date.now() - toolStart;
+          toolCallLog.push({ name: name as ToolName, ok: false, ms, error: "called before plan_research" });
+          sse(res, "trace", { step: ++step, tool: name, input: args, ok: false, ms, error: "call plan_research first" });
+          messages.push({
+            role: "tool", tool_call_id: tc.id,
+            content: JSON.stringify({ error: "call plan_research first, before any search tool" }),
+          });
+          continue;
+        }
+
+        // ── plan_research: DEEP SEARCH ONLY. Emits `plan`, not `trace` — the contract's
+        // event order is plan → trace* → sources* → token* → done, so the plan is its own
+        // event, arriving before any retrieval trace.
+        if (name === "plan_research") {
+          const raw: Array<{ question: string; reason?: string }> = Array.isArray(args.subQuestions) ? args.subQuestions : [];
+          planSubQuestions = raw.slice(0, MAX_SUB_QUESTIONS).map((sq, i) => ({
+            i: i + 1,
+            question: sq.question,
+            ...(sq.reason ? { reason: sq.reason } : {}),
+          }));
+          ok = planSubQuestions.length >= 2; // contract floor; system prompt asks for MIN_SUB_QUESTIONS
+          if (!ok) errStr = `plan_research returned ${planSubQuestions.length} sub-question(s), need at least 2`;
+
+          toolCallLog.push({ name: "plan_research", ok, ms: Date.now() - toolStart, ...(errStr ? { error: errStr } : {}) });
+          if (ok) {
+            sse(res, "plan", { subQuestions: planSubQuestions, ...(args.reason ? { reason: args.reason } : {}) });
+          }
+          messages.push({
+            role: "tool", tool_call_id: tc.id,
+            content: ok
+              ? JSON.stringify({ accepted: planSubQuestions.length, subQuestions: planSubQuestions })
+              : JSON.stringify({ error: errStr }),
+          });
+          continue;
+        }
+
         // Call the actual tool
         try {
           result = await dispatchTool(
@@ -305,6 +445,9 @@ export async function runAgentLoop(opts: {
           );
           ok = result.ok;
           if (!ok) errStr = result.error;
+
+          const subQuestion: number | undefined =
+            depth === "deep" && typeof args.subQuestion === "number" ? args.subQuestion : undefined;
 
           // Track sources from search results
           if (ok && name === "web_search" && result.data) {
@@ -316,6 +459,7 @@ export async function runAgentLoop(opts: {
                 title:   r.title,
                 url:     r.url,
                 snippet: r.snippet?.slice(0, 300) ?? "",
+                ...(subQuestion ? { subQuestion } : {}),
               });
             }
           }
@@ -330,6 +474,7 @@ export async function runAgentLoop(opts: {
                 docId:   chunk.docId,
                 locator: chunk.locator,
                 snippet: chunk.text?.slice(0, 300) ?? "",
+                ...(subQuestion ? { subQuestion } : {}),
               });
             }
           }
@@ -340,7 +485,9 @@ export async function runAgentLoop(opts: {
         }
 
         const ms = Date.now() - toolStart;
-        toolCallLog.push({ name: name as OurTool, ok, ms, ...(errStr ? { error: errStr } : {}) });
+        const traceSubQuestion: number | undefined =
+          depth === "deep" && typeof args.subQuestion === "number" ? args.subQuestion : undefined;
+        toolCallLog.push({ name: name as ToolName, ok, ms, ...(errStr ? { error: errStr } : {}) });
 
         // Send trace event so browser shows "searching..."
         sse(res, "trace", {
@@ -350,6 +497,7 @@ export async function runAgentLoop(opts: {
           ok,
           ms,
           ...(errStr ? { error: errStr } : {}),
+          ...(traceSubQuestion ? { subQuestion: traceSubQuestion } : {}),
         });
 
         // Feed result back to LLM
@@ -379,17 +527,21 @@ export async function runAgentLoop(opts: {
       costUsd,
       searchCached,
       terminated:   "cap",
-      depth:        "quick",
+      depth,
+      ...(planSubQuestions ? { subQuestions: planSubQuestions.length } : {}),
     });
     await saveRunLog(requestId, {
       requestId,
+      userId,
+      threadId,
+      query,
       tokens:       totalIn + totalOut,
       wallClockSec: latencyMs / 1000,
       costUsd,
       terminated:   "cap",
-      depth:        "quick",
+      depth,
       toolCalls:    toolCallLog,
-      createdAt:    nowIso(),
+      createdAt:    new Date(),
     });
   }
 }
@@ -408,7 +560,8 @@ async function dispatchTool(
     case "fetch_page":
       return fetchPage(args.url);
     case "search_documents":
-      return searchDocuments(args.query, args.spaceId ?? spaceId ?? "");
+      // Always the request's own Space — never the model's guess (see buildTools).
+      return searchDocuments(args.query, spaceId ?? "");
     case "recall_memory":
       return recallMemory(userId, args.query);
     case "save_memory":
@@ -419,9 +572,13 @@ async function dispatchTool(
 }
 
 // ── Run log writer ────────────────────────────────────────────
-// runs/<requestId>.json — RunLog plus the requestId/createdAt fields that make the
-// file self-identifying (RunDoc's shape, minus the fields Mongo assigns on insert).
-async function saveRunLog(requestId: string, log: RunLog & { requestId: string; createdAt: string }) {
+// runs/<requestId>.json — RunLog plus the RunDoc fields (minus what Mongo assigns on
+// insert) that let a run be found later: by requestId for build-report.mjs's
+// --successful/--failing, by userId for the deep-search daily cap count.
+async function saveRunLog(
+  requestId: string,
+  log: RunLog & { requestId: string; userId: string; threadId: string; query: string; createdAt: Date }
+) {
   await mkdir("runs", { recursive: true });
   await writeFile(
     join("runs", `${requestId}.json`),

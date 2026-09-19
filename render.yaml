@@ -1,0 +1,34 @@
+services:
+  - type: web
+    name: lumina
+    runtime: docker
+    dockerfilePath: ./deploy/render/Dockerfile
+    dockerContext: .
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: LOG_LEVEL
+        value: info
+      - key: LLM_MODEL
+        value: openai/gpt-4o-mini
+      - key: EMBEDDING_MODEL
+        value: baai/bge-m3
+      - key: SEARCH_PROVIDER
+        value: tavily
+      - key: VECTOR_BACKEND
+        value: mongo-cosine-scan
+      - key: IMAGE_DAILY_CAP
+        value: "10"
+      - key: DEEP_DAILY_CAP
+        value: "5"
+      - key: DRY_RUN
+        value: "true"
+      # Secrets — set these in the Render dashboard, never committed here.
+      - key: MONGODB_URI
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: TAVILY_API_KEY
+        sync: false
