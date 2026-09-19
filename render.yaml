@@ -2,7 +2,7 @@ services:
   - type: web
     name: lumina
     runtime: docker
-    dockerfilePath: ./deploy/render/Dockerfile
+    dockerfilePath: ./Dockerfile
     dockerContext: .
     plan: free
     healthCheckPath: /health
