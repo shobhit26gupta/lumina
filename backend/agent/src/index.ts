@@ -2,7 +2,7 @@ import "dotenv/config";
 import express from "express";
 import multer from "multer";
 import { Readable } from "stream";
-import { connectDB, col, getGridUploads, getGridFiles } from "./db.js";
+import { connectDB, col, getDB, getGridUploads, getGridFiles } from "./db.js";
 import { genId, calcCost, nowIso } from "./utils.js";
 import { runAgentLoop } from "./loop.js";
 import { startWorker } from "./worker/index.js";
@@ -428,8 +428,17 @@ app.get("/artifacts/:id/file", async (req, res) => {
 });
 
 // ── Evals report ─────────────────────────────────────────────
+// A deployed container's filesystem is ephemeral (Render's free tier rebuilds it from
+// the image on every spin-up), so reports/report.json written by a local eval run never
+// reaches the live instance. Mongo — the same store everything else already lives in —
+// survives restarts; local disk stays the fallback for pure local-dev iteration.
 app.get("/evals/report.json", async (req, res) => {
   try {
+    const doc = await getDB().collection("meta").findOne({ _id: "evalsReport" as any });
+    if (doc) {
+      const { _id, ...report } = doc as any;
+      return res.json(report);
+    }
     const { readFile } = await import("fs/promises");
     const report = JSON.parse(
       await readFile("reports/report.json", "utf8")
