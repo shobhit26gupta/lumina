@@ -5,3 +5,5 @@ runs/
 reports/
 web/dist/
 *.log
+.vercel
+.env*
